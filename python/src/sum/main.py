@@ -2,7 +2,8 @@ import os
 import logging
 import threading
 
-from common import middleware, message_protocol, fruit_item
+from common import middleware, fruit_item
+from common.message_protocol.internal import InternalMessage
 
 ID = int(os.environ["ID"])
 MOM_HOST = os.environ["MOM_HOST"]
@@ -24,35 +25,52 @@ class SumFilter:
                 MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
             )
             self.data_output_exchanges.append(data_output_exchange)
-        self.amount_by_fruit = {}
+        self.data_per_client = {}
 
-    def _process_data(self, fruit, amount):
-        logging.info(f"Process data")
-        self.amount_by_fruit[fruit] = self.amount_by_fruit.get(
-            fruit, fruit_item.FruitItem(fruit, 0)
-        ) + fruit_item.FruitItem(fruit, int(amount))
+    def _process_data(self, client_id, fruit, amount):
+        logging.info(f"Processing data for client {client_id}")
+        if client_id not in self.data_per_client:
+            self.data_per_client[client_id] = {}
+        total_fruits_of_client = self.data_per_client[client_id]
 
-    def _process_eof(self):
-        logging.info(f"Broadcasting data messages")
-        for final_fruit_item in self.amount_by_fruit.values():
+        # Aca basicamente lo que hacemos es decir, 
+        # "si no existe la fruta(FruitItem) en el diccionario
+        #  para este cliente lo inicializo con cantidad 0
+        #  y lo devuelvo, si existe simplemente lo devuelvo"
+        current_fruit_item = total_fruits_of_client.get(fruit, fruit_item.FruitItem(fruit, 0))
+        total_fruits_of_client[fruit] = current_fruit_item + fruit_item.FruitItem(fruit,
+                                                                                   int(amount))
+
+    def _process_eof(self, client_id):
+        logging.info(f"Processing EOF for client {client_id}")
+        for final_fruit_item in self.data_per_client[client_id].values():
             for data_output_exchange in self.data_output_exchanges:
+                internal_msg = InternalMessage(client_id=client_id,
+                                                data=[final_fruit_item.fruit,
+                                                       final_fruit_item.amount])
                 data_output_exchange.send(
-                    message_protocol.internal.serialize(
-                        [final_fruit_item.fruit, final_fruit_item.amount]
-                    )
+                    internal_msg.serialize()
                 )
 
-        logging.info(f"Broadcasting EOF message")
+        logging.info(f"Finished processing EOF for client {client_id}")
         for data_output_exchange in self.data_output_exchanges:
-            data_output_exchange.send(message_protocol.internal.serialize([]))
+            data_output_exchange.send(InternalMessage(client_id=client_id,
+                                                       data=None).serialize())
+        if client_id in self.data_per_client:
+            del self.data_per_client[client_id]
+        logging.info(f"Cleaned data for client {client_id}")
 
 
     def process_data_messsage(self, message, ack, nack):
-        fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 2:
-            self._process_data(*fields)
+        internal_message = InternalMessage.deserialize(message)
+        client_id = internal_message.client_id
+        message_data = internal_message.data
+
+        if message_data:
+            fruit, amount = message_data 
+            self._process_data(client_id, fruit, amount)
         else:
-            self._process_eof(*fields)
+            self._process_eof(client_id)
         ack()
 
     def start(self):
