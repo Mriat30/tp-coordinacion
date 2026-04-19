@@ -16,70 +16,111 @@ AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 
 class SumFilter:
     def __init__(self):
-        self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
-            MOM_HOST, INPUT_QUEUE
-        )
-        self.data_output_exchanges = []
-        for i in range(AGGREGATION_AMOUNT):
-            data_output_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
-                MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
-            )
-            self.data_output_exchanges.append(data_output_exchange)
         self.data_per_client = {}
+        self.lock = threading.Lock()
 
     def _process_data(self, client_id, fruit, amount):
         logging.info(f"Processing data for client {client_id}")
-        if client_id not in self.data_per_client:
-            self.data_per_client[client_id] = {}
-        total_fruits_of_client = self.data_per_client[client_id]
+        # Este lock garantiza que el hilo de control no flushee datos de un cliente mientras se están procesando datos de ese mismo cliente 
+        with self.lock:
+            if client_id not in self.data_per_client:
+                self.data_per_client[client_id] = {}
+            total_fruits_of_client = self.data_per_client[client_id]
 
-        # Aca basicamente lo que hacemos es decir, 
-        # "si no existe la fruta(FruitItem) en el diccionario
-        #  para este cliente lo inicializo con cantidad 0
-        #  y lo devuelvo, si existe simplemente lo devuelvo"
-        current_fruit_item = total_fruits_of_client.get(fruit, fruit_item.FruitItem(fruit, 0))
-        total_fruits_of_client[fruit] = current_fruit_item + fruit_item.FruitItem(fruit,
-                                                                                   int(amount))
+            # Aca basicamente lo que hacemos es decir, 
+            # "si no existe la fruta(FruitItem) en el diccionario
+            #  para este cliente lo inicializo con cantidad 0
+            #  y lo devuelvo, si existe simplemente lo devuelvo"
+            current_fruit_item = total_fruits_of_client.get(fruit, fruit_item.FruitItem(fruit, 0))
+            total_fruits_of_client[fruit] = current_fruit_item + fruit_item.FruitItem(fruit, int(amount))
 
-    def _process_eof(self, client_id):
+    def _process_eof(self, client_id, data_output_exchanges):
         logging.info(f"Processing EOF for client {client_id}")
-        for final_fruit_item in self.data_per_client[client_id].values():
-            for data_output_exchange in self.data_output_exchanges:
-                internal_msg = InternalMessage(client_id=client_id,
-                                                data=[final_fruit_item.fruit,
-                                                       final_fruit_item.amount])
-                data_output_exchange.send(
-                    internal_msg.serialize()
-                )
-
-        logging.info(f"Finished processing EOF for client {client_id}")
-        for data_output_exchange in self.data_output_exchanges:
-            data_output_exchange.send(InternalMessage(client_id=client_id,
-                                                       data=None).serialize())
-        if client_id in self.data_per_client:
+        # Este lock evita que se flusheen eof de un cliente mientras se están procesando datos de ese mismo cliente
+        with self.lock:
+            if client_id not in self.data_per_client:
+                logging.info(f"No data for client {client_id}, skipping flush")
+                return
+            items = list(self.data_per_client[client_id].values())
             del self.data_per_client[client_id]
+
+        for final_fruit_item in items:
+            for data_output_exchange in data_output_exchanges:
+                internal_msg = InternalMessage(
+                    client_id=client_id,
+                    data=[final_fruit_item.fruit, final_fruit_item.amount]
+                )
+                data_output_exchange.send(internal_msg.serialize())
+        logging.info(f"Finished processing EOF for client {client_id}")
+        for data_output_exchange in data_output_exchanges:
+            data_output_exchange.send(
+                InternalMessage(client_id=client_id, data=None).serialize()
+            )
         logging.info(f"Cleaned data for client {client_id}")
+    
 
+    # Este metodo se ejecuta en el ciclo de vida del hilo, por eso se inicializan los exchanges dentro del metodo y no en el constructor, para evitar problemas de inicializacion
+    def _run_data_consumer(self):
+        input_queue = middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, INPUT_QUEUE)
+        control_exchange_publisher = middleware.MessageMiddlewareExchangeRabbitMQ(
+            MOM_HOST, SUM_CONTROL_EXCHANGE,
+            [f"{SUM_CONTROL_EXCHANGE}_{i}" for i in range(SUM_AMOUNT) if i != ID]
+        )
+        data_output_exchanges = [
+            middleware.MessageMiddlewareExchangeRabbitMQ(
+                MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
+            ) for i in range(AGGREGATION_AMOUNT)
+        ]
 
-    def process_data_messsage(self, message, ack, nack):
-        internal_message = InternalMessage.deserialize(message)
-        client_id = internal_message.client_id
-        message_data = internal_message.data
+        def callback(message, ack, nack):
+            internal_message = InternalMessage.deserialize(message)
+            client_id = internal_message.client_id
+            if internal_message.data:
+                fruit, amount = internal_message.data
+                self._process_data(client_id, fruit, amount)
+            else:
+                logging.info(f"Got EOF from gateway for client {client_id}, flushing and propagating")
+                self._process_eof(client_id, data_output_exchanges)
+                control_exchange_publisher.send(
+                    InternalMessage(client_id=client_id, data=None).serialize()
+                )
+            ack()
 
-        if message_data:
-            fruit, amount = message_data 
-            self._process_data(client_id, fruit, amount)
-        else:
-            self._process_eof(client_id)
-        ack()
+        logging.info("Data consumer started")
+        input_queue.start_consuming(callback)
+
+    # Este metodo se ejecuta en el ciclo de vida del hilo, por eso se inicializan los exchanges dentro del metodo y no en el constructor, para evitar problemas de inicializacion
+    def _run_control_consumer(self):
+        control_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+            MOM_HOST, SUM_CONTROL_EXCHANGE, [f"{SUM_CONTROL_EXCHANGE}_{ID}"]
+        )
+        data_output_exchanges = [
+            middleware.MessageMiddlewareExchangeRabbitMQ(
+                MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
+            ) for i in range(AGGREGATION_AMOUNT)
+        ]
+
+        def callback(message, ack, nack):
+            internal_message = InternalMessage.deserialize(message)
+            client_id = internal_message.client_id
+            if internal_message.data is None:
+                logging.info(f"Got EOF from control exchange for client {client_id}, flushing")
+                self._process_eof(client_id, data_output_exchanges)
+            ack()
+
+        logging.info("Control consumer started")
+        control_exchange.start_consuming(callback)
 
     def start(self):
-        self.input_queue.start_consuming(self.process_data_messsage)
+        t_control = threading.Thread(target=self._run_control_consumer, daemon=True)
+        t_control.start()
+        self._run_data_consumer()
+        t_control.join()
+
 
 def main():
     logging.basicConfig(level=logging.INFO)
-    sum_filter = SumFilter()
-    sum_filter.start()
+    SumFilter().start()
     return 0
 
 
