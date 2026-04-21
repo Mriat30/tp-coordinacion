@@ -1,7 +1,7 @@
 import os
 import logging
 
-from common import middleware
+from common import middleware, fruit_item
 from common.message_protocol.internal import InternalMessage
 
 MOM_HOST = os.environ["MOM_HOST"]
@@ -23,16 +23,48 @@ class JoinFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
+        self.data_per_client = {}
+        self.eof_count_per_client = {}
 
-    def process_messsage(self, message, ack, nack):
-        logging.info("Received top")
+    def _process_data(self, client_id, data):
+        if client_id not in self.data_per_client:
+            self.data_per_client[client_id] = {}
+        for fruit, amount in data:
+            client_inventory = self.data_per_client[client_id]
+            current_fruit_item = client_inventory.get(
+                fruit, fruit_item.FruitItem(fruit, 0)
+            )
+            client_inventory[fruit] = current_fruit_item + fruit_item.FruitItem(
+                fruit, int(amount)
+            )
+
+    def _process_eof(self, client_id):
+        self.eof_count_per_client[client_id] = self.eof_count_per_client.get(client_id, 0) + 1
+        if self.eof_count_per_client[client_id] < AGGREGATION_AMOUNT:
+            return
+
+        all_items = sorted(self.data_per_client.get(client_id, {}).values())
+        top_items = all_items[-TOP_SIZE:]
+        top_items.reverse()
+        fruit_top_data = [(item.fruit, item.amount) for item in top_items]
+
+        self.output_queue.send(InternalMessage(client_id=client_id, data=fruit_top_data).serialize())
+
+        if client_id in self.data_per_client:
+            del self.data_per_client[client_id]
+        del self.eof_count_per_client[client_id]
+    
+    def process_message(self, message, ack, nack):
         internal_message = InternalMessage.deserialize(message)
-        self.output_queue.send(internal_message.serialize())
+        client_id = internal_message.client_id
+        if internal_message.data:
+            self._process_data(client_id, internal_message.data)
+        else:
+            self._process_eof(client_id)
         ack()
 
     def start(self):
-        self.input_queue.start_consuming(self.process_messsage)
-
+        self.input_queue.start_consuming(self.process_message)
 
 def main():
     logging.basicConfig(level=logging.INFO)

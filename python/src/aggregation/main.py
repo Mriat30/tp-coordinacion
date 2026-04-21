@@ -57,15 +57,18 @@ class AggregationFilter:
             logging.info(f"EOF {self.eof_count_per_client[client_id]}/{SUM_AMOUNT} for client {client_id}, waiting for more")
             return
 
-        # Tengo todos los EOFs, flusheo solo si tengo datos
+        # Tengo todos los EOFs, flusheo solo si tengo datos del cliente
         logging.info(f"All EOFs received for client {client_id}")
         if client_id in self.data_per_client:
             all_sorted_items = sorted(self.data_per_client[client_id].values())
-            top_fruit_items = all_sorted_items[-TOP_SIZE:]
-            top_fruit_items.reverse()
-            fruit_top_data = [(item.fruit, item.amount) for item in top_fruit_items]
-            self.output_queue.send(InternalMessage(client_id=client_id, data=fruit_top_data).serialize())
+            all_sorted_items.reverse()
+            fruit_data = [(item.fruit, item.amount) for item in all_sorted_items]  # sin filtrar
+            self.output_queue.send(InternalMessage(client_id=client_id, data=fruit_data).serialize())
             del self.data_per_client[client_id]
+
+        # EOF al Join siempre, para que sepa cuando calcular el top global, aunque no tenga datos de este aggregador para el cliente
+        self.output_queue.send(InternalMessage(client_id=client_id, data=None).serialize())
+        del self.eof_count_per_client[client_id]
 
         
 def main():

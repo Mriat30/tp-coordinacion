@@ -19,6 +19,12 @@ class SumFilter:
         self.data_per_client = {}
         self.lock = threading.Lock()
 
+    def start(self):
+        t_control = threading.Thread(target=self._run_control_consumer, daemon=True)
+        t_control.start()
+        self._run_data_consumer()
+        t_control.join()
+
     def _process_data(self, client_id, fruit, amount):
         logging.info(f"Processing data for client {client_id}")
         # Este lock garantiza que el hilo de control no flushee datos de un cliente mientras se están procesando datos de ese mismo cliente 
@@ -36,28 +42,28 @@ class SumFilter:
 
     def _process_eof(self, client_id, data_output_exchanges):
         logging.info(f"Processing EOF for client {client_id}")
-        # Este lock evita que se flusheen eof de un cliente mientras se están procesando datos de ese mismo cliente
         with self.lock:
             if client_id not in self.data_per_client:
-                logging.info(f"No data for client {client_id}, skipping flush")
-                return
-            items = list(self.data_per_client[client_id].values())
-            del self.data_per_client[client_id]
+                items = []
+            else:
+                items = list(self.data_per_client[client_id].values())
+                del self.data_per_client[client_id]
 
         for final_fruit_item in items:
-            for data_output_exchange in data_output_exchanges:
-                internal_msg = InternalMessage(
+            agg_index = self._get_aggregator_index(final_fruit_item.fruit)
+            data_output_exchanges[agg_index].send(
+                InternalMessage(
                     client_id=client_id,
                     data=[final_fruit_item.fruit, final_fruit_item.amount]
-                )
-                data_output_exchange.send(internal_msg.serialize())
+                ).serialize()
+            )
         logging.info(f"Finished processing EOF for client {client_id}")
+        # EOF a todos los Aggs SIEMPRE, haya o no haya tenido datos
         for data_output_exchange in data_output_exchanges:
             data_output_exchange.send(
                 InternalMessage(client_id=client_id, data=None).serialize()
             )
-        logging.info(f"Cleaned data for client {client_id}")
-    
+        logging.info(f"Cleaned data for client {client_id}")    
 
     # Este metodo se ejecuta en el ciclo de vida del hilo, por eso se inicializan los exchanges dentro del metodo y no en el constructor, para evitar problemas de inicializacion
     def _run_data_consumer(self):
@@ -111,12 +117,11 @@ class SumFilter:
         logging.info("Control consumer started")
         control_exchange.start_consuming(callback)
 
-    def start(self):
-        t_control = threading.Thread(target=self._run_control_consumer, daemon=True)
-        t_control.start()
-        self._run_data_consumer()
-        t_control.join()
-
+    # Me devuelve el indice del Aggregator correspondiente a esa fruta, garantiza que:
+    # 1) La misma fruta siempre va al mismo Aggregator
+    # 2) Las frutas se distribuyen de manera uniforme entre los Aggregators
+    def _get_aggregator_index(self, fruit):
+        return hash(fruit) % AGGREGATION_AMOUNT
 
 def main():
     logging.basicConfig(level=logging.INFO)
