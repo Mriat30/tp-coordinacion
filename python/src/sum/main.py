@@ -1,6 +1,7 @@
 import os
 import logging
 import threading
+import zlib
 
 from common import middleware, fruit_item
 from common.message_protocol.internal import InternalMessage
@@ -121,7 +122,7 @@ class SumFilter:
     # 1) La misma fruta siempre va al mismo Aggregator
     # 2) Las frutas se distribuyen de manera uniforme entre los Aggregators
     def _get_aggregator_index(self, fruit):
-        return hash(fruit) % AGGREGATION_AMOUNT
+        return zlib.crc32(fruit.encode()) % AGGREGATION_AMOUNT
 
 def main():
     logging.basicConfig(level=logging.INFO)
