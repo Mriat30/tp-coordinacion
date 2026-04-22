@@ -61,8 +61,9 @@ class AggregationFilter:
         logging.info(f"All EOFs received for client {client_id}")
         if client_id in self.data_per_client:
             all_sorted_items = sorted(self.data_per_client[client_id].values())
-            all_sorted_items.reverse()
-            fruit_data = [(item.fruit, item.amount) for item in all_sorted_items]  # sin filtrar
+            top_fruit_items = all_sorted_items[-TOP_SIZE:]
+            top_fruit_items.reverse()
+            fruit_data = [(item.fruit, item.amount) for item in top_fruit_items]
             self.output_queue.send(InternalMessage(client_id=client_id, data=fruit_data).serialize())
             del self.data_per_client[client_id]
 
