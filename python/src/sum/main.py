@@ -2,6 +2,7 @@ import os
 import logging
 import threading
 import zlib
+import signal
 
 from common import middleware, fruit_item
 from common.message_protocol.internal import InternalMessage
@@ -28,28 +29,26 @@ class SumFilter:
 
     def _process_data(self, client_id, fruit, amount):
         logging.info(f"Processing data for client {client_id}")
-        # Este lock garantiza que el hilo de control no flushee datos de un cliente mientras se están procesando datos de ese mismo cliente 
-        with self.lock:
-            if client_id not in self.data_per_client:
-                self.data_per_client[client_id] = {}
-            total_fruits_of_client = self.data_per_client[client_id]
+        if client_id not in self.data_per_client:
+            self.data_per_client[client_id] = {}
+        total_fruits_of_client = self.data_per_client[client_id]
 
-            # Aca basicamente lo que hacemos es decir, 
-            # "si no existe la fruta(FruitItem) en el diccionario
-            #  para este cliente lo inicializo con cantidad 0
-            #  y lo devuelvo, si existe simplemente lo devuelvo"
-            current_fruit_item = total_fruits_of_client.get(fruit, fruit_item.FruitItem(fruit, 0))
-            total_fruits_of_client[fruit] = current_fruit_item + fruit_item.FruitItem(fruit, int(amount))
+        # Aca basicamente lo que hacemos es decir, 
+        # "si no existe la fruta(FruitItem) en el diccionario
+        #  para este cliente lo inicializo con cantidad 0
+        #  y lo devuelvo, si existe simplemente lo devuelvo"
+        current_fruit_item = total_fruits_of_client.get(fruit, fruit_item.FruitItem(fruit, 0))
+        total_fruits_of_client[fruit] = current_fruit_item + fruit_item.FruitItem(fruit, int(amount))
 
-    def _process_eof(self, client_id, data_output_exchanges):
+    def _process_eof(self, client_id):
         logging.info(f"Processing EOF for client {client_id}")
-        with self.lock:
-            if client_id not in self.data_per_client:
-                items = []
-            else:
-                items = list(self.data_per_client[client_id].values())
-                del self.data_per_client[client_id]
+        if client_id not in self.data_per_client:
+            return []
+        items = list(self.data_per_client[client_id].values())
+        del self.data_per_client[client_id]
+        return items
 
+    def _send_eof(self, client_id, items, data_output_exchanges):
         for final_fruit_item in items:
             agg_index = self._get_aggregator_index(final_fruit_item.fruit)
             data_output_exchanges[agg_index].send(
@@ -80,14 +79,19 @@ class SumFilter:
         ]
 
         def callback(message, ack, nack):
-            internal_message = InternalMessage.deserialize(message)
-            client_id = internal_message.client_id
-            if internal_message.data:
-                fruit, amount = internal_message.data
-                self._process_data(client_id, fruit, amount)
-            else:
-                logging.info(f"Got EOF from gateway for client {client_id}, flushing and propagating")
-                self._process_eof(client_id, data_output_exchanges)
+            items = None
+            with self.lock:
+                internal_message = InternalMessage.deserialize(message)
+                client_id = internal_message.client_id
+                if internal_message.data:
+                    fruit, amount = internal_message.data
+                    self._process_data(client_id, fruit, amount)
+                else:
+                    logging.info(f"Got EOF from gateway for client {client_id}, flushing and propagating")
+                    items = self._process_eof(client_id)
+
+            if items is not None:
+                self._send_eof(client_id, items, data_output_exchanges)
                 control_exchange_publisher.send(
                     InternalMessage(client_id=client_id, data=None).serialize()
                 )
@@ -108,11 +112,16 @@ class SumFilter:
         ]
 
         def callback(message, ack, nack):
-            internal_message = InternalMessage.deserialize(message)
-            client_id = internal_message.client_id
-            if internal_message.data is None:
-                logging.info(f"Got EOF from control exchange for client {client_id}, flushing")
-                self._process_eof(client_id, data_output_exchanges)
+            items = None
+            with self.lock:
+                internal_message = InternalMessage.deserialize(message)
+                client_id = internal_message.client_id
+                if internal_message.data is None:
+                    logging.info(f"Got EOF from control exchange for client {client_id}, flushing")
+                    items = self._process_eof(client_id)
+
+            if items is not None:
+                self._send_eof(client_id, items, data_output_exchanges)
             ack()
 
         logging.info("Control consumer started")
