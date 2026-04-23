@@ -20,12 +20,54 @@ class SumFilter:
     def __init__(self):
         self.data_per_client = {}
         self.lock = threading.Lock()
+        self._sigterm_prev_handler = None
+        self._input_queue = None
+        self._control_exchange = None
+        self._control_exchange_publisher = None
+        self._data_output_exchanges = []
+        self._control_output_exchanges = []
+
+    def __enter__(self):
+        self._sigterm_prev_handler = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, self._handle_sigterm)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._restore_sigterm_handler()
+        self.close()
+        return False
 
     def start(self):
         t_control = threading.Thread(target=self._run_control_consumer, daemon=True)
         t_control.start()
         self._run_data_consumer()
         t_control.join()
+
+    def stop(self):
+        if self._input_queue:
+            self._input_queue.stop_consuming()
+        if self._control_exchange:
+            self._control_exchange.stop_consuming()
+
+    def close(self):
+        if self._control_exchange_publisher:
+            self._control_exchange_publisher.close()
+        if self._control_exchange:
+            self._control_exchange.close()
+        if self._input_queue:
+            self._input_queue.close()
+        for exchange in self._data_output_exchanges:
+            exchange.close()
+        for exchange in self._control_output_exchanges:
+            exchange.close()
+
+    def _handle_sigterm(self, signum, frame):
+        logging.info("SIGTERM received, stopping sum consumers")
+        self.stop()
+
+    def _restore_sigterm_handler(self):
+        if self._sigterm_prev_handler is not None:
+            signal.signal(signal.SIGTERM, self._sigterm_prev_handler)
 
     def _process_data(self, client_id, fruit, amount):
         logging.info(f"Processing data for client {client_id}")
@@ -67,16 +109,18 @@ class SumFilter:
 
     # Este metodo se ejecuta en el ciclo de vida del hilo, por eso se inicializan los exchanges dentro del metodo y no en el constructor, para evitar problemas de inicializacion
     def _run_data_consumer(self):
-        input_queue = middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, INPUT_QUEUE)
-        control_exchange_publisher = middleware.MessageMiddlewareExchangeRabbitMQ(
+        self._input_queue = middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, INPUT_QUEUE)
+        self._control_exchange_publisher = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, SUM_CONTROL_EXCHANGE,
             [f"{SUM_CONTROL_EXCHANGE}_{i}" for i in range(SUM_AMOUNT) if i != ID]
         )
-        data_output_exchanges = [
+        self._data_output_exchanges = [
             middleware.MessageMiddlewareExchangeRabbitMQ(
                 MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
             ) for i in range(AGGREGATION_AMOUNT)
         ]
+        data_output_exchanges = self._data_output_exchanges
+        control_exchange_publisher = self._control_exchange_publisher
 
         def callback(message, ack, nack):
             items = None
@@ -98,18 +142,19 @@ class SumFilter:
             ack()
 
         logging.info("Data consumer started")
-        input_queue.start_consuming(callback)
+        self._input_queue.start_consuming(callback)
 
     # Este metodo se ejecuta en el ciclo de vida del hilo, por eso se inicializan los exchanges dentro del metodo y no en el constructor, para evitar problemas de inicializacion
     def _run_control_consumer(self):
-        control_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+        self._control_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, SUM_CONTROL_EXCHANGE, [f"{SUM_CONTROL_EXCHANGE}_{ID}"]
         )
-        data_output_exchanges = [
+        self._control_output_exchanges = [
             middleware.MessageMiddlewareExchangeRabbitMQ(
                 MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
             ) for i in range(AGGREGATION_AMOUNT)
         ]
+        data_output_exchanges = self._control_output_exchanges
 
         def callback(message, ack, nack):
             items = None
@@ -125,7 +170,7 @@ class SumFilter:
             ack()
 
         logging.info("Control consumer started")
-        control_exchange.start_consuming(callback)
+        self._control_exchange.start_consuming(callback)
 
     # Me devuelve el indice del Aggregator correspondiente a esa fruta, garantiza que:
     # 1) La misma fruta siempre va al mismo Aggregator
@@ -135,7 +180,8 @@ class SumFilter:
 
 def main():
     logging.basicConfig(level=logging.INFO)
-    SumFilter().start()
+    with SumFilter() as sum_filter:
+        sum_filter.start()
     return 0
 
 
