@@ -28,22 +28,17 @@ class JoinFilter:
 
     def _process_data(self, client_id, data):
         if client_id not in self.data_per_client:
-            self.data_per_client[client_id] = {}
+            self.data_per_client[client_id] = []
+        client_inventory = self.data_per_client[client_id]
         for fruit, amount in data:
-            client_inventory = self.data_per_client[client_id]
-            current_fruit_item = client_inventory.get(
-                fruit, fruit_item.FruitItem(fruit, 0)
-            )
-            client_inventory[fruit] = current_fruit_item + fruit_item.FruitItem(
-                fruit, int(amount)
-            )
+            client_inventory.append(fruit_item.FruitItem(fruit, int(amount)))
 
     def _process_eof(self, client_id):
         self.eof_count_per_client[client_id] = self.eof_count_per_client.get(client_id, 0) + 1
         if self.eof_count_per_client[client_id] < AGGREGATION_AMOUNT:
             return
 
-        all_items = sorted(self.data_per_client.get(client_id, {}).values())
+        all_items = sorted(self.data_per_client.get(client_id, []))
         top_items = all_items[-TOP_SIZE:]
         top_items.reverse()
         fruit_top_data = [(item.fruit, item.amount) for item in top_items]
