@@ -3,6 +3,11 @@ import logging
 import signal
 
 from common import middleware, fruit_item
+from common.middleware.middleware import (
+    MessageMiddlewareCloseError,
+    MessageMiddlewareDisconnectedError,
+    MessageMiddlewareMessageError,
+)
 from common.message_protocol.internal import InternalMessage
 
 ID = int(os.environ["ID"])
@@ -59,18 +64,32 @@ class AggregationFilter:
             self.stop()
 
     def start(self):
-        self.input_exchange.start_consuming(self.process_message)
+        try:
+            self.input_exchange.start_consuming(self.process_message)
+        except (MessageMiddlewareDisconnectedError, MessageMiddlewareMessageError) as e:
+            logging.error(f"Aggregation consumer stopped due to middleware error: {e}")
+            self.stop()
+            raise
 
     
     def stop(self):
         if self.input_exchange:
-            self.input_exchange.stop_consuming()
+            try:
+                self.input_exchange.stop_consuming()
+            except (MessageMiddlewareDisconnectedError, MessageMiddlewareMessageError) as e:
+                logging.error(f"Error stopping aggregation consumer: {e}")
     
     def close(self):
         if self.input_exchange:
-            self.input_exchange.close()
+            try:
+                self.input_exchange.close()
+            except MessageMiddlewareCloseError as e:
+                logging.error(f"Error closing aggregation input exchange: {e}")
         if self.output_queue:
-            self.output_queue.close()
+            try:
+                self.output_queue.close()
+            except MessageMiddlewareCloseError as e:
+                logging.error(f"Error closing aggregation output queue: {e}")
 
     def _handle_sigterm(self, signum, frame):
         logging.info("SIGTERM received, stopping aggregation consumer")

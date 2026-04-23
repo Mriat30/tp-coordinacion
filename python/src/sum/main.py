@@ -5,6 +5,11 @@ import zlib
 import signal
 
 from common import middleware, fruit_item
+from common.middleware.middleware import (
+    MessageMiddlewareCloseError,
+    MessageMiddlewareDisconnectedError,
+    MessageMiddlewareMessageError,
+)
 from common.message_protocol.internal import InternalMessage
 
 ID = int(os.environ["ID"])
@@ -45,21 +50,42 @@ class SumFilter:
 
     def stop(self):
         if self._input_queue:
-            self._input_queue.stop_consuming()
+            try:
+                self._input_queue.stop_consuming()
+            except (MessageMiddlewareDisconnectedError, MessageMiddlewareMessageError) as e:
+                logging.error(f"Error stopping sum input consumer: {e}")
         if self._control_exchange:
-            self._control_exchange.stop_consuming()
+            try:
+                self._control_exchange.stop_consuming()
+            except (MessageMiddlewareDisconnectedError, MessageMiddlewareMessageError) as e:
+                logging.error(f"Error stopping sum control consumer: {e}")
 
     def close(self):
         if self._control_exchange_publisher:
-            self._control_exchange_publisher.close()
+            try:
+                self._control_exchange_publisher.close()
+            except MessageMiddlewareCloseError as e:
+                logging.error(f"Error closing sum control publisher: {e}")
         if self._control_exchange:
-            self._control_exchange.close()
+            try:
+                self._control_exchange.close()
+            except MessageMiddlewareCloseError as e:
+                logging.error(f"Error closing sum control exchange: {e}")
         if self._input_queue:
-            self._input_queue.close()
+            try:
+                self._input_queue.close()
+            except MessageMiddlewareCloseError as e:
+                logging.error(f"Error closing sum input queue: {e}")
         for exchange in self._data_output_exchanges:
-            exchange.close()
+            try:
+                exchange.close()
+            except MessageMiddlewareCloseError as e:
+                logging.error(f"Error closing sum data exchange: {e}")
         for exchange in self._control_output_exchanges:
-            exchange.close()
+            try:
+                exchange.close()
+            except MessageMiddlewareCloseError as e:
+                logging.error(f"Error closing sum control exchange output: {e}")
 
     def _handle_sigterm(self, signum, frame):
         logging.info("SIGTERM received, stopping sum consumers")
@@ -142,7 +168,12 @@ class SumFilter:
             ack()
 
         logging.info("Data consumer started")
-        self._input_queue.start_consuming(callback)
+        try:
+            self._input_queue.start_consuming(callback)
+        except (MessageMiddlewareDisconnectedError, MessageMiddlewareMessageError) as e:
+            logging.error(f"Sum data consumer stopped due to middleware error: {e}")
+            self.stop()
+            raise
 
     # Este metodo se ejecuta en el ciclo de vida del hilo, por eso se inicializan los exchanges dentro del metodo y no en el constructor, para evitar problemas de inicializacion
     def _run_control_consumer(self):
@@ -170,7 +201,11 @@ class SumFilter:
             ack()
 
         logging.info("Control consumer started")
-        self._control_exchange.start_consuming(callback)
+        try:
+            self._control_exchange.start_consuming(callback)
+        except (MessageMiddlewareDisconnectedError, MessageMiddlewareMessageError) as e:
+            logging.error(f"Sum control consumer stopped due to middleware error: {e}")
+            self.stop()
 
     # Me devuelve el indice del Aggregator correspondiente a esa fruta, garantiza que:
     # 1) La misma fruta siempre va al mismo Aggregator

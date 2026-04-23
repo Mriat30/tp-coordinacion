@@ -3,6 +3,11 @@ import logging
 import signal
 
 from common import middleware, fruit_item
+from common.middleware.middleware import (
+    MessageMiddlewareCloseError,
+    MessageMiddlewareDisconnectedError,
+    MessageMiddlewareMessageError,
+)
 from common.message_protocol.internal import InternalMessage
 
 MOM_HOST = os.environ["MOM_HOST"]
@@ -78,17 +83,31 @@ class JoinFilter:
             self.stop()
 
     def start(self):
-        self.input_queue.start_consuming(self.process_message)
+        try:
+            self.input_queue.start_consuming(self.process_message)
+        except (MessageMiddlewareDisconnectedError, MessageMiddlewareMessageError) as e:
+            logging.error(f"Join consumer stopped due to middleware error: {e}")
+            self.stop()
+            raise
 
     def stop(self):
         if self.input_queue:
-            self.input_queue.stop_consuming()
+            try:
+                self.input_queue.stop_consuming()
+            except (MessageMiddlewareDisconnectedError, MessageMiddlewareMessageError) as e:
+                logging.error(f"Error stopping join consumer: {e}")
 
     def close(self):
         if self.input_queue:
-            self.input_queue.close()
+            try:
+                self.input_queue.close()
+            except MessageMiddlewareCloseError as e:
+                logging.error(f"Error closing join input queue: {e}")
         if self.output_queue:
-            self.output_queue.close()
+            try:
+                self.output_queue.close()
+            except MessageMiddlewareCloseError as e:
+                logging.error(f"Error closing join output queue: {e}")
 
     def _handle_sigterm(self, signum, frame):
         logging.info("SIGTERM received, stopping join consumer")
