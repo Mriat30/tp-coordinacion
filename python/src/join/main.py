@@ -1,5 +1,6 @@
 import os
 import logging
+import signal
 
 from common import middleware, fruit_item
 from common.message_protocol.internal import InternalMessage
@@ -17,14 +18,27 @@ TOP_SIZE = int(os.environ["TOP_SIZE"])
 class JoinFilter:
 
     def __init__(self):
+        self.input_queue = None
+        self.output_queue = None
+        self.data_per_client = {}
+        self.eof_count_per_client = {}
+        self._sigterm_prev_handler = None
+
+    def __enter__(self):
         self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, INPUT_QUEUE
         )
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
-        self.data_per_client = {}
-        self.eof_count_per_client = {}
+        self._sigterm_prev_handler = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, self._handle_sigterm)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._restore_sigterm_handler()
+        self.close()
+        return False
 
     def _process_data(self, client_id, data):
         if client_id not in self.data_per_client:
@@ -50,21 +64,44 @@ class JoinFilter:
         del self.eof_count_per_client[client_id]
     
     def process_message(self, message, ack, nack):
-        internal_message = InternalMessage.deserialize(message)
-        client_id = internal_message.client_id
-        if internal_message.data:
-            self._process_data(client_id, internal_message.data)
-        else:
-            self._process_eof(client_id)
-        ack()
+        try:
+            internal_message = InternalMessage.deserialize(message)
+            client_id = internal_message.client_id
+            if internal_message.data:
+                self._process_data(client_id, internal_message.data)
+            else:
+                self._process_eof(client_id)
+            ack()
+        except Exception as e:
+            logging.error(f"Error processing message: {e}")
+            nack()
+            self.stop()
 
     def start(self):
         self.input_queue.start_consuming(self.process_message)
 
+    def stop(self):
+        if self.input_queue:
+            self.input_queue.stop_consuming()
+
+    def close(self):
+        if self.input_queue:
+            self.input_queue.close()
+        if self.output_queue:
+            self.output_queue.close()
+
+    def _handle_sigterm(self, signum, frame):
+        logging.info("SIGTERM received, stopping join consumer")
+        self.stop()
+
+    def _restore_sigterm_handler(self):
+        if self._sigterm_prev_handler is not None:
+            signal.signal(signal.SIGTERM, self._sigterm_prev_handler)
+
 def main():
     logging.basicConfig(level=logging.INFO)
-    join_filter = JoinFilter()
-    join_filter.start()
+    with JoinFilter() as join_filter:
+        join_filter.start()
 
     return 0
 
