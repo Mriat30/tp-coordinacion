@@ -21,9 +21,15 @@ class SumFilter:
         self.lock = threading.Lock()
 
     def start(self):
+        t_router = None
         t_control = threading.Thread(target=self._run_control_consumer, daemon=True)
         t_control.start()
+        if self._should_start_router():
+            t_router = threading.Thread(target=self._run_router_consumer, daemon=True)
+            t_router.start()
         self._run_data_consumer()
+        if t_router:
+            t_router.join()
         t_control.join()
 
     def _process_data(self, client_id, fruit, amount):
@@ -66,9 +72,11 @@ class SumFilter:
             )
         logging.info(f"Cleaned data for client {client_id}")    
 
-    # Este metodo se ejecuta en el ciclo de vida del hilo, por eso se inicializan los exchanges dentro del metodo y no en el constructor, para evitar problemas de inicializacion
+    # Este metodo se ejecuta en el ciclo de vida del hilo, por eso se inicializan los exchanges dentro del metodo y no en el constructor,
+    #  para evitar problemas de inicializacion
     def _run_data_consumer(self):
-        input_queue = middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, INPUT_QUEUE)
+        data_queue_name = self._get_data_queue_name()
+        input_queue = middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, data_queue_name)
         control_exchange_publisher = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, SUM_CONTROL_EXCHANGE,
             [f"{SUM_CONTROL_EXCHANGE}_{i}" for i in range(SUM_AMOUNT) if i != ID]
@@ -93,7 +101,31 @@ class SumFilter:
                 )
             ack()
 
-        logging.info("Data consumer started")
+        logging.info(f"Data consumer started (queue={data_queue_name})")
+        input_queue.start_consuming(callback)
+
+    # Este metodo existe para cuando debe haber enrutamiento, para que cada SumFilter se suscriba a su propia cola, 
+    # y el Router se encargue de enrutar cada mensaje a la cola del SumFilter correspondiente, en base al client_id del mensaje
+    # Es el handler del hilo que levanta el SUM_ID == 0 (cuando ha mas de un SUMs)
+    def _run_router_consumer(self):
+        input_queue = middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, INPUT_QUEUE)
+        routed_queues = [
+            middleware.MessageMiddlewareQueueRabbitMQ(
+                MOM_HOST, self._get_routed_queue_name(i)
+            ) for i in range(SUM_AMOUNT)
+        ]
+
+        def callback(message, ack, nack):
+            try:
+                internal_message = InternalMessage.deserialize(message)
+                target_sum = self._get_sum_index(internal_message.client_id)
+                routed_queues[target_sum].send(message)
+                ack()
+            except Exception as e:
+                logging.error(f"Router failed to forward message: {e}")
+                nack()
+
+        logging.info(f"Router started (source={INPUT_QUEUE})")
         input_queue.start_consuming(callback)
 
     # Este metodo se ejecuta en el ciclo de vida del hilo, por eso se inicializan los exchanges dentro del metodo y no en el constructor, para evitar problemas de inicializacion
@@ -118,11 +150,25 @@ class SumFilter:
         logging.info("Control consumer started")
         control_exchange.start_consuming(callback)
 
+    def _get_data_queue_name(self):
+        if SUM_AMOUNT == 1:
+            return INPUT_QUEUE
+        return self._get_routed_queue_name(ID)
+
+    def _get_routed_queue_name(self, sum_id):
+        return f"{INPUT_QUEUE}_{sum_id}"
+
     # Me devuelve el indice del Aggregator correspondiente a esa fruta, garantiza que:
     # 1) La misma fruta siempre va al mismo Aggregator
     # 2) Las frutas se distribuyen de manera uniforme entre los Aggregators
     def _get_aggregator_index(self, fruit):
         return zlib.crc32(fruit.encode()) % AGGREGATION_AMOUNT
+
+    def _get_sum_index(self, client_id):
+        return zlib.crc32(client_id.encode()) % SUM_AMOUNT
+
+    def _should_start_router(self):
+        return SUM_AMOUNT > 1 and ID == 0
 
 def main():
     logging.basicConfig(level=logging.INFO)
