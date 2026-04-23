@@ -12,7 +12,12 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
         self.channel.start_consuming()
 
     def stop_consuming(self):
-        self.channel.stop_consuming()
+        try:
+            self.connection.add_callback_threadsafe(self.channel.stop_consuming)
+        except pika.exceptions.AMQPConnectionError:
+            raise MessageMiddlewareDisconnectedError("Connection to RabbitMQ lost while stopping consumption.")
+        except Exception as e:
+            raise MessageMiddlewareMessageError(f"An error occurred while stopping consumption: {str(e)}")
 
     def send(self, message):
         try: 
